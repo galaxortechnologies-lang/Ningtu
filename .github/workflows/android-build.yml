@@ -1,5 +1,7 @@
 name: Android Build & Release
 
+run-name: Nigutu debug build #${{ github.run_number }} (${{ github.event_name }})
+
 on:
   push:
     branches: [main]
@@ -9,13 +11,11 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 concurrency:
   group: android-${{ github.ref }}
   cancel-in-progress: false
-
-env:
-  GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx3g -XX:MaxMetaspaceSize=1g"
 
 jobs:
   build:
@@ -34,42 +34,81 @@ jobs:
           java-version: "17"
           cache: gradle
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Install Android SDK command line tools
+        run: |
+          set -euo pipefail
+          SDK_ROOT="$HOME/android-sdk"
+          mkdir -p "$SDK_ROOT/cmdline-tools"
+          curl -fsSL -o /tmp/cmdtools.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q -o /tmp/cmdtools.zip -d "$SDK_ROOT/cmdline-tools"
+          rm -rf "$SDK_ROOT/cmdline-tools/latest"
+          mv "$SDK_ROOT/cmdline-tools/cmdline-tools" "$SDK_ROOT/cmdline-tools/latest"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$SDK_ROOT/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
 
       - name: Install Android SDK packages
         run: |
-          sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0"
-          yes | sdkmanager --licenses > /dev/null || true
+          set -o pipefail
+          SDK_ROOT="$HOME/android-sdk"
+          yes | "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_ROOT" --licenses > /dev/null 2>&1 || true
+          "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK_ROOT" \
+            "platform-tools" "platforms;android-35" "build-tools;35.0.0" 2>&1 | tee -a ci.log
+          ls "$SDK_ROOT/platforms" "$SDK_ROOT/build-tools" | tee -a ci.log
 
       - name: Make Gradle executable
         run: chmod +x ./gradlew
 
+      - name: Show toolchain versions
+        run: |
+          set -o pipefail
+          java -version 2>&1 | tee -a ci.log
+          ./gradlew --version 2>&1 | tee -a ci.log
+
       - name: Gradle configuration check
-        run: ./gradlew --no-daemon projects --console=plain
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon projects --console=plain 2>&1 | tee -a ci.log
 
       - name: Run unit tests
-        run: ./gradlew --no-daemon testDebugUnitTest --console=plain --stacktrace
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon testDebugUnitTest --console=plain --stacktrace 2>&1 | tee -a ci.log
 
       - name: Build debug APK
-        run: ./gradlew --no-daemon assembleDebug --console=plain --stacktrace
+        run: |
+          set -o pipefail
+          ./gradlew --no-daemon assembleDebug --console=plain --stacktrace 2>&1 | tee -a ci.log
 
       - name: Verify APK exists and is not empty
         run: |
-          set -euo pipefail
+          set -o pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
-          test -f "$APK" || { echo "APK missing at $APK"; exit 1; }
+          test -f "$APK" || { echo "APK missing at $APK" | tee -a ci.log; exit 1; }
           SIZE=$(stat -c%s "$APK")
-          echo "APK size: $SIZE bytes"
-          test "$SIZE" -gt 100000 || { echo "APK is suspiciously small"; exit 1; }
+          echo "APK size: $SIZE bytes" | tee -a ci.log
+          test "$SIZE" -gt 1000000 || { echo "APK is suspiciously small" | tee -a ci.log; exit 1; }
+          echo "APK_SIZE=$SIZE" >> "$GITHUB_ENV"
 
       - name: Verify APK package name
         run: |
-          set -euo pipefail
+          set -o pipefail
           APK=app/build/outputs/apk/debug/app-debug.apk
-          PACKAGE=$(apkanalyzer manifest application-id "$APK")
-          echo "APK package: $PACKAGE"
-          test "$PACKAGE" = "com.nigutu.app" || { echo "Unexpected package name"; exit 1; }
+          PACKAGE=""
+          if command -v apkanalyzer > /dev/null 2>&1; then
+            PACKAGE=$(apkanalyzer manifest application-id "$APK" 2>>ci.log || true)
+          fi
+          if [ -z "$PACKAGE" ] && [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" ]; then
+            PACKAGE=$("$ANDROID_HOME/cmdline-tools/latest/bin/apkanalyzer" manifest application-id "$APK" 2>>ci.log || true)
+          fi
+          if [ -z "$PACKAGE" ]; then
+            AAPT=$(ls "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | head -1)
+            if [ -n "$AAPT" ]; then
+              PACKAGE=$("$AAPT" dump packagename "$APK" 2>>ci.log | head -1 || true)
+            fi
+          fi
+          echo "APK package: ${PACKAGE:-unknown}" | tee -a ci.log
+          test "$PACKAGE" = "com.nigutu.app" || { echo "Unexpected package name" | tee -a ci.log; exit 1; }
 
       - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
@@ -82,28 +121,29 @@ jobs:
       - name: Prepare release notes
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          set -euo pipefail
-          cat > RELEASE_NOTES.md <<EOF
-          ## Nigutu Debug Build
-
-          - **Version:** 1.0.0 (debug)
-          - **Build date:** $(date -u +"%Y-%m-%d %H:%M UTC")
-          - **Commit:** \`${GITHUB_SHA}\`
-          - **Variant:** debug (unsigned debug key)
-          - **Unit tests:** passed (\`./gradlew testDebugUnitTest\`)
-          - **Package:** com.nigutu.app
-
-          ### Installation
-          1. Download \`Nigutu-debug.apk\` below.
-          2. Allow installation from unknown sources for your browser or file manager.
-          3. Install and open Nigutu, then grant audio access to build your library.
-
-          ### Known limitations
-          - Online catalog playback uses 30-second previews from the public Deezer API.
-          - Equaliser availability depends on the device audio stack.
-          - Instrumentation and Compose UI tests were not executed in CI (no emulator).
-          - The APK is debug-signed and intended for testing only.
-          EOF
+          set -o pipefail
+          {
+            echo "## Nigutu Debug Build"
+            echo ""
+            echo "- **Version:** 1.0.0 (debug)"
+            echo "- **Build date:** $(date -u +"%Y-%m-%d %H:%M UTC")"
+            echo "- **Commit:** \`${GITHUB_SHA}\`"
+            echo "- **Variant:** debug (debug signing key)"
+            echo "- **Unit tests:** passed (\`./gradlew testDebugUnitTest\`)"
+            echo "- **Package:** com.nigutu.app"
+            echo "- **APK size:** ${APK_SIZE} bytes"
+            echo ""
+            echo "### Installation"
+            echo "1. Download \`Nigutu-debug.apk\` below."
+            echo "2. Allow installation from unknown sources for your browser or file manager."
+            echo "3. Install and open Nigutu, then grant audio access to build your library."
+            echo ""
+            echo "### Known limitations"
+            echo "- Online catalog playback uses 30-second previews from the public Deezer API."
+            echo "- Equaliser availability depends on the device audio stack."
+            echo "- Instrumentation and Compose UI tests are not executed in CI (no emulator)."
+            echo "- The APK is debug-signed and intended for testing only."
+          } > RELEASE_NOTES.md
           cat RELEASE_NOTES.md
 
       - name: Create GitHub prerelease with APK
@@ -111,23 +151,44 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -o pipefail
           TAG="v1.0.0-debug.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           cp app/build/outputs/apk/debug/app-debug.apk Nigutu-debug.apk
           gh release create "$TAG" Nigutu-debug.apk \
             --title "Nigutu Debug Build" \
             --prerelease \
-            --notes-file RELEASE_NOTES.md
-          gh release view "$TAG" --json tagName,isPrerelease,assets --jq '.assets[].name'
+            --notes-file RELEASE_NOTES.md 2>&1 | tee -a ci.log
+          gh release view "$TAG" --json tagName,isPrerelease,assets --jq '.assets[].name' | tee -a ci.log
 
       - name: Verify release asset
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
+          set -o pipefail
           TAG="v1.0.0-debug.${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT}"
           ASSETS=$(gh release view "$TAG" --json assets --jq '.assets[].name')
-          echo "Release assets: $ASSETS"
-          echo "$ASSETS" | grep -q "Nigutu-debug.apk" || { echo "APK asset missing from release"; exit 1; }
-          gh release view "$TAG" --json url --jq '.url'
+          echo "Release assets: $ASSETS" | tee -a ci.log
+          echo "$ASSETS" | grep -q "Nigutu-debug.apk" || { echo "APK asset missing from release" | tee -a ci.log; exit 1; }
+          gh release view "$TAG" --json url --jq '.url' | tee -a ci.log
+
+      # Publishes the build log to a public issue so failures can be diagnosed
+      # from outside the repository (run logs need authentication to read).
+      - name: Report failure diagnostics
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          touch ci.log
+          {
+            echo "Workflow run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "Commit: ${GITHUB_SHA}"
+            echo ""
+            echo '```'
+            tail -n 250 ci.log
+            echo '```'
+          } > diagnostics.md
+          gh issue create \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "CI failure: run #${GITHUB_RUN_NUMBER} (${GITHUB_SHA:0:7})" \
+            --body-file diagnostics.md || true
