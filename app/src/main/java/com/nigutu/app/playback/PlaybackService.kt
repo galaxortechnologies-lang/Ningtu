@@ -33,6 +33,7 @@ class PlaybackService : MediaSessionService() {
 
     private var mediaSession: MediaSession? = null
     private var player: ExoPlayer? = null
+    private var effectsSessionId: Int = C.AUDIO_SESSION_ID_UNSET
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
 
     override fun onCreate() {
@@ -51,7 +52,6 @@ class PlaybackService : MediaSessionService() {
             .build()
 
         player = exoPlayer
-        audioEffects.attach(exoPlayer)
 
         val sessionActivity = PendingIntent.getActivity(
             this,
@@ -69,11 +69,26 @@ class PlaybackService : MediaSessionService() {
                     }
                 }
             }
+
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                if (isPlaying) attachEffectsIfReady(exoPlayer)
+            }
         })
 
         mediaSession = MediaSession.Builder(this, exoPlayer)
             .setSessionActivity(sessionActivity)
             .build()
+    }
+
+    /**
+     * Effects need a live audio session, which only exists once playback has
+     * started; attach them lazily and again if the session id changes.
+     */
+    private fun attachEffectsIfReady(exoPlayer: ExoPlayer) {
+        val sessionId = exoPlayer.audioSessionId
+        if (sessionId == C.AUDIO_SESSION_ID_UNSET || sessionId == effectsSessionId) return
+        effectsSessionId = sessionId
+        audioEffects.attach(exoPlayer)
     }
 
     override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? =

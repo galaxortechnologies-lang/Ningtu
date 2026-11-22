@@ -30,12 +30,17 @@ class SettingsViewModel @Inject constructor(
     val audioEffectsState: StateFlow<AudioEffectsState> = audioEffects.state
 
     init {
-        // Keep the native effects in sync with the stored preferences.
+        // Effects attach once playback starts, so re-apply the stored
+        // preferences whenever the native effects become available.
         viewModelScope.launch {
-            settingsRepository.settings.collect { settings ->
-                if (audioEffects.state.value.supported) {
-                    audioEffects.setEnabled(settings.equalizerEnabled)
-                    audioEffects.setBassBoostStrength(settings.bassBoostStrength)
+            audioEffects.state.collect { effects ->
+                if (!effects.supported) return@collect
+                val stored = settings.value
+                if (effects.enabled != stored.equalizerEnabled) {
+                    audioEffects.setEnabled(stored.equalizerEnabled)
+                }
+                if (effects.bassBoostStrength != stored.bassBoostStrength) {
+                    audioEffects.setBassBoostStrength(stored.bassBoostStrength)
                 }
             }
         }
