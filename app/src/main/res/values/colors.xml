@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="nigutu_black">#FF07070A</color>
+    <color name="nigutu_charcoal">#FF121319</color>
+    <color name="nigutu_primary">#FF8B5CF6</color>
+    <color name="nigutu_secondary">#FF22D3EE</color>
+    <color name="white">#FFFFFFFF</color>
+</resources>
